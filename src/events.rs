@@ -53,12 +53,22 @@ async fn ensure_stream(js: &Context, subjects: &[&str]) -> Result<(), Box<dyn st
     Ok(())
 }
 
+pub fn stamp_event_id(payload: &mut Value) {
+    if let Some(object) = payload.as_object_mut()
+        && !object.contains_key("event_id")
+    {
+        object.insert("event_id".into(), Value::String(uuid::Uuid::new_v4().to_string()));
+    }
+}
+
 pub async fn publish(
     js: &Context,
     subject: &str,
     payload: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ack = js.publish(subject.to_owned(), payload.to_string().into()).await?;
+    let mut message = payload.clone();
+    stamp_event_id(&mut message);
+    let ack = js.publish(subject.to_owned(), message.to_string().into()).await?;
     ack.await?;
     Ok(())
 }
@@ -148,4 +158,21 @@ pub async fn run_consumer(
     }
     tracing::info!(durable, subjects = ?subjects, "consumer bound");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stamps_missing_event_id_only() {
+        let mut fresh = json!({ "user_id": "u1" });
+        stamp_event_id(&mut fresh);
+        assert!(fresh["event_id"].as_str().is_some_and(|id| id.len() == 36));
+
+        let mut stamped = json!({ "event_id": "keep-me" });
+        stamp_event_id(&mut stamped);
+        assert_eq!(stamped["event_id"], "keep-me");
+    }
 }
