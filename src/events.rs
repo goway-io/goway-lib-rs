@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,11 +19,26 @@ pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 pub type Handler = Arc<dyn Fn(String, Value) -> BoxFuture<'static, HandlerResult> + Send + Sync>;
 
 pub async fn connect(nats_url: &str, subjects: &[&str]) -> Result<Context, Box<dyn std::error::Error + Send + Sync>> {
-    let client = async_nats::ConnectOptions::new()
+    let mut options = async_nats::ConnectOptions::new()
         .connection_timeout(CONNECT_TIMEOUT)
-        .retry_on_initial_connect()
-        .connect(nats_url)
-        .await?;
+        .retry_on_initial_connect();
+
+    // async-nats builds the CONNECT frame purely from ConnectOptions.auth; it
+    // parses user:pass out of the URL into ServerAddr but never applies it. So
+    // a URL like nats://user:pass@host:4222 authenticates as anonymous and the
+    // server answers "authorization violation". Lift the credentials across
+    // explicitly, reusing the client's own parser so percent-encoding is
+    // handled the same way.
+    if let Ok(addr) = async_nats::ServerAddr::from_str(nats_url)
+        && let Some(user) = addr.username()
+    {
+        options = options.user_and_password(
+            user.to_owned(),
+            addr.password().unwrap_or_default().to_owned(),
+        );
+    }
+
+    let client = options.connect(nats_url).await?;
     let js = async_nats::jetstream::new(client);
     ensure_stream(&js, subjects).await?;
     Ok(js)
