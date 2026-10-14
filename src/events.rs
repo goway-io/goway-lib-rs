@@ -32,10 +32,7 @@ pub async fn connect(nats_url: &str, subjects: &[&str]) -> Result<Context, Box<d
     if let Ok(addr) = async_nats::ServerAddr::from_str(nats_url)
         && let Some(user) = addr.username()
     {
-        options = options.user_and_password(
-            user.to_owned(),
-            addr.password().unwrap_or_default().to_owned(),
-        );
+        options = options.user_and_password(user.to_owned(), addr.password().unwrap_or_default().to_owned());
     }
 
     let client = options.connect(nats_url).await?;
