@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -16,15 +16,13 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v7
-      - run: git config --global url."https://x-access-token:${{ secrets.GOWAY_DEPS_TOKEN }}@github.com/".insteadOf "ssh://git@github.com/"
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fetch --locked
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --all-targets --frozen -- -D warnings
+      - run: cargo test --frozen
