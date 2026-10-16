@@ -66,14 +66,17 @@ async fn ensure_stream(js: &Context, subjects: &[&str]) -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// Time-ordered (UUIDv7) like every Python publisher's, so ids sort by when they were made across both runtimes.
 pub fn stamp_event_id(payload: &mut Value) {
     if let Some(object) = payload.as_object_mut()
         && !object.contains_key("event_id")
     {
-        object.insert("event_id".into(), Value::String(uuid::Uuid::new_v4().to_string()));
+        object.insert("event_id".into(), Value::String(uuid::Uuid::now_v7().to_string()));
     }
 }
 
+/// The event's id rides as `Nats-Msg-Id` too, so JetStream drops a second publish of the same event (a retry after
+/// a lost ack) inside the stream's duplicate window instead of storing it twice.
 pub async fn publish(
     js: &Context,
     subject: &str,
@@ -81,7 +84,13 @@ pub async fn publish(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut message = payload.clone();
     stamp_event_id(&mut message);
-    let ack = js.publish(subject.to_owned(), message.to_string().into()).await?;
+    let mut headers = async_nats::HeaderMap::new();
+    if let Some(event_id) = message.get("event_id").and_then(Value::as_str) {
+        headers.insert("Nats-Msg-Id", event_id);
+    }
+    let ack = js
+        .publish_with_headers(subject.to_owned(), headers, message.to_string().into())
+        .await?;
     ack.await?;
     Ok(())
 }
@@ -182,7 +191,12 @@ mod tests {
     fn stamps_missing_event_id_only() {
         let mut fresh = json!({ "user_id": "u1" });
         stamp_event_id(&mut fresh);
-        assert!(fresh["event_id"].as_str().is_some_and(|id| id.len() == 36));
+        let id = uuid::Uuid::parse_str(fresh["event_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            id.get_version_num(),
+            7,
+            "time-ordered, as the Python publishers stamp them"
+        );
 
         let mut stamped = json!({ "event_id": "keep-me" });
         stamp_event_id(&mut stamped);
