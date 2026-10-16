@@ -10,6 +10,10 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 
 pub const STREAM: &str = "GOWAY";
+
+/// How long the stream keeps an event: a week, the value goway-lib's Python publisher keeps too, or the two would
+/// fight over it. Consumers ack within seconds; the window is for a worker that is down.
+pub const STREAM_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
 pub const MAX_DELIVER: i64 = 5;
 pub const NAK_DELAY: Duration = Duration::from_secs(5);
 pub const ACK_WAIT: Duration = Duration::from_secs(30);
@@ -48,16 +52,18 @@ async fn ensure_stream(js: &Context, subjects: &[&str]) -> Result<(), Box<dyn st
             let mut config = existing.info().await?.config.clone();
             let current: BTreeSet<String> = config.subjects.iter().cloned().collect();
             let merged: BTreeSet<String> = current.union(&desired).cloned().collect();
-            if merged != current {
+            if merged != current || config.max_age != STREAM_MAX_AGE {
                 config.subjects = merged.into_iter().collect();
+                config.max_age = STREAM_MAX_AGE;
                 js.update_stream(config.clone()).await?;
-                tracing::info!(stream = STREAM, subjects = ?config.subjects, "stream subjects extended");
+                tracing::info!(stream = STREAM, subjects = ?config.subjects, max_age = ?STREAM_MAX_AGE, "stream set");
             }
         }
         Err(_) => {
             js.create_stream(stream::Config {
                 name: STREAM.to_owned(),
                 subjects: desired.into_iter().collect(),
+                max_age: STREAM_MAX_AGE,
                 ..Default::default()
             })
             .await?;
