@@ -1045,6 +1045,7 @@ dependencies = [
  "futures-util",
  "jsonwebtoken",
  "redis",
+ "regex",
  "sentry",
  "serde",
  "serde_json",
