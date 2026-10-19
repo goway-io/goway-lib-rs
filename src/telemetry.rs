@@ -1,11 +1,31 @@
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
+use opentelemetry::logs::{AnyValue, LogRecord as _};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{InstrumentationScope, KeyValue, global};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::{ExporterBuildError, LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::logs::{LogProcessor, SdkLogRecord, SdkLoggerProvider};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use regex::Regex;
 use sentry::protocol::Event;
 use serde_json::Value;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const FILTERED: &str = "[Filtered]";
+
+/// Metrics leave for the collector every half minute; an alert looks at a few minutes.
+const METRIC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Targets whose events stay in the container log: the exporters' own, and the HTTP client they send with, would
+/// loop through the exporter that is failing.
+const LOCAL_ONLY_TARGETS: [&str; 5] = ["opentelemetry", "reqwest", "hyper", "h2", "tower"];
 
 const PII_KEY_WORDS: [&str; 14] = [
     "phone",
@@ -45,14 +65,140 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     .collect()
 });
 
-pub fn init(service_name: &str, environment: &str, glitchtip_dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
+/// Keeps error reporting and the OTLP pipelines alive; dropping it at the end of `main` flushes what is left.
+pub struct Telemetry {
+    _sentry: Option<sentry::ClientInitGuard>,
+    otel: Option<Providers>,
+}
+
+struct Providers {
+    tracer: SdkTracerProvider,
+    logger: SdkLoggerProvider,
+    meter: SdkMeterProvider,
+}
+
+impl Drop for Telemetry {
+    fn drop(&mut self) {
+        if let Some(otel) = self.otel.take() {
+            let _ = otel.tracer.shutdown();
+            let _ = otel.logger.shutdown();
+            let _ = otel.meter.shutdown();
+        }
+    }
+}
+
+/// Every log record bound for the collector gets the scrubbing an error report gets.
+#[derive(Debug)]
+struct ScrubLogs;
+
+impl LogProcessor for ScrubLogs {
+    fn emit(&self, record: &mut SdkLogRecord, _scope: &InstrumentationScope) {
+        if let Some(AnyValue::String(body)) = record.body() {
+            let clean = scrub_text(body.as_str());
+            if clean != body.as_str() {
+                record.set_body(AnyValue::String(clean.into()));
+            }
+        }
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+}
+
+/// Logs to stdout always; to GlitchTip with a DSN; traces, logs and metrics over OTLP/HTTP with an endpoint (the
+/// collector's base URL). Spans also carry their context across NATS (see `events`), so a request's trace continues
+/// in the services that consume what it published.
+pub fn init(
+    service_name: &str,
+    environment: &str,
+    glitchtip_dsn: Option<&str>,
+    otlp_endpoint: Option<&str>,
+) -> Telemetry {
+    let otel = otlp_endpoint
+        .filter(|endpoint| !endpoint.is_empty())
+        .and_then(|endpoint| match providers(service_name, environment, endpoint) {
+            Ok(providers) => Some(providers),
+            Err(err) => {
+                eprintln!("OTLP export disabled: {err}");
+                None
+            }
+        });
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let exported = || {
+        filter_fn(|meta| {
+            !LOCAL_ONLY_TARGETS
+                .iter()
+                .any(|target| meta.target().starts_with(target))
+        })
+    };
+    let traces = otel.as_ref().map(|providers| {
+        tracing_opentelemetry::layer()
+            .with_tracer(providers.tracer.tracer("goway"))
+            .with_filter(exported())
+    });
+    let logs = otel
+        .as_ref()
+        .map(|providers| OpenTelemetryTracingBridge::new(&providers.logger).with_filter(exported()));
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .with(sentry::integrations::tracing::layer().span_filter(|_| false))
+        .with(traces)
+        .with(logs)
         .init();
+    if let Some(providers) = &otel {
+        global::set_tracer_provider(providers.tracer.clone());
+        global::set_meter_provider(providers.meter.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        tracing::info!(service = service_name, "OTLP export enabled");
+    }
+    Telemetry {
+        _sentry: init_glitchtip(service_name, environment, glitchtip_dsn),
+        otel,
+    }
+}
 
+fn providers(service_name: &str, environment: &str, endpoint: &str) -> Result<Providers, ExporterBuildError> {
+    let base = endpoint.trim_end_matches('/');
+    let resource = Resource::builder()
+        .with_service_name(service_name.to_owned())
+        .with_attribute(KeyValue::new("deployment.environment.name", environment.to_owned()))
+        .build();
+    let spans = SpanExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{base}/v1/traces"))
+        .build()?;
+    let logs = LogExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{base}/v1/logs"))
+        .build()?;
+    let metrics = MetricExporter::builder()
+        .with_http()
+        .with_endpoint(format!("{base}/v1/metrics"))
+        .build()?;
+    Ok(Providers {
+        tracer: SdkTracerProvider::builder()
+            .with_resource(resource.clone())
+            .with_batch_exporter(spans)
+            .build(),
+        logger: SdkLoggerProvider::builder()
+            .with_resource(resource.clone())
+            .with_log_processor(ScrubLogs)
+            .with_batch_exporter(logs)
+            .build(),
+        meter: SdkMeterProvider::builder()
+            .with_resource(resource)
+            .with_reader(PeriodicReader::builder(metrics).with_interval(METRIC_INTERVAL).build())
+            .build(),
+    })
+}
+
+fn init_glitchtip(
+    service_name: &str,
+    environment: &str,
+    glitchtip_dsn: Option<&str>,
+) -> Option<sentry::ClientInitGuard> {
     let dsn = glitchtip_dsn.filter(|dsn| !dsn.is_empty())?;
     let mut options = sentry::ClientOptions::default();
     options.release = sentry::release_name!();
@@ -196,5 +342,28 @@ mod tests {
         assert_eq!(key_words("pickupAddress"), ["pickup", "address"]);
         assert_eq!(key_words("X-Driver_phone.number"), ["x", "driver", "phone", "number"]);
         assert_eq!(key_words("platform"), ["platform"]);
+    }
+
+    #[test]
+    fn a_log_bound_for_the_collector_loses_its_phone_and_coordinates() {
+        use opentelemetry::logs::{Logger as _, LoggerProvider as _};
+        use opentelemetry_sdk::logs::InMemoryLogExporter;
+
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_log_processor(ScrubLogs)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let logger = provider.logger("test");
+        let mut record = logger.create_log_record();
+        record.set_body(AnyValue::String(
+            "driver +998 90 123 45 67 at 41.311081, 69.240562".into(),
+        ));
+        logger.emit(record);
+        let logs = exporter.get_emitted_logs().expect("emitted");
+        assert_eq!(
+            logs[0].record.body(),
+            Some(&AnyValue::String("driver [Filtered] at [Filtered]".into()))
+        );
     }
 }

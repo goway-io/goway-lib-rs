@@ -1,13 +1,18 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_nats::jetstream::consumer::pull;
 use async_nats::jetstream::{Context, stream};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::{KeyValue, global};
 use serde_json::Value;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub const STREAM: &str = "GOWAY";
 
@@ -94,11 +99,78 @@ pub async fn publish(
     if let Some(event_id) = message.get("event_id").and_then(Value::as_str) {
         headers.insert("Nats-Msg-Id", event_id);
     }
+    let context = tracing::Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut HeaderInjector(&mut headers))
+    });
     let ack = js
         .publish_with_headers(subject.to_owned(), headers, message.to_string().into())
         .await?;
     ack.await?;
     Ok(())
+}
+
+/// The same measures goway-lib's Python consumers report, under the same names, so one dashboard covers both runtimes.
+struct ConsumerMetrics {
+    processed: Counter<u64>,
+    duration: Histogram<f64>,
+    lag: Histogram<f64>,
+}
+
+static METRICS: LazyLock<ConsumerMetrics> = LazyLock::new(|| {
+    let meter = global::meter("goway.events");
+    meter
+        .u64_observable_gauge("goway.consumer.pending")
+        .with_unit("{message}")
+        .with_description("Messages a durable consumer has not been delivered yet")
+        .with_callback(|gauge| {
+            if let Ok(pending) = PENDING.lock() {
+                for (durable, count) in pending.iter() {
+                    gauge.observe(*count, &[KeyValue::new("durable", durable.clone())]);
+                }
+            }
+        })
+        .build();
+    ConsumerMetrics {
+        processed: meter
+            .u64_counter("goway.consumer.processed")
+            .with_unit("{message}")
+            .with_description("Deliveries handled, by outcome")
+            .build(),
+        duration: meter
+            .f64_histogram("goway.consumer.duration")
+            .with_unit("s")
+            .with_description("Time a handler took for one delivery")
+            .build(),
+        lag: meter
+            .f64_histogram("goway.consumer.lag")
+            .with_unit("s")
+            .with_description("Time an event waited in the stream before this delivery")
+            .build(),
+    }
+});
+
+/// What each durable has not been delivered yet, as JetStream reported with its latest delivery.
+static PENDING: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct HeaderInjector<'a>(&'a mut async_nats::HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key, value.as_str());
+    }
+}
+
+struct HeaderExtractor<'a>(&'a async_nats::HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(|value| value.as_str())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.iter().map(|(name, _)| name.as_ref()).collect()
+    }
 }
 
 fn sanitize(subject: &str) -> String {
@@ -130,6 +202,7 @@ pub async fn run_consumer(
             .await?;
 
         let js_for_task = js.clone();
+        let durable_label = durable.to_owned();
         let dlq = dlq_subject.clone();
         let task_handler = Arc::clone(&handler);
         tokio::spawn(async move {
@@ -159,13 +232,41 @@ pub async fn run_consumer(
                             continue;
                         }
                     };
-                    match task_handler(subject.clone(), payload).await {
+                    let labels = [
+                        KeyValue::new("durable", durable_label.clone()),
+                        KeyValue::new("subject", subject.clone()),
+                    ];
+                    let delivered = message.info().map(|info| info.delivered).unwrap_or(1);
+                    if let Ok(info) = message.info() {
+                        if let Ok(mut pending) = PENDING.lock() {
+                            pending.insert(name.clone(), info.pending);
+                        }
+                        if delivered == 1 {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as i128);
+                            let waited = now.unwrap_or_default() - info.published.unix_timestamp_nanos();
+                            METRICS.lag.record((waited.max(0) as f64) / 1e9, &labels);
+                        }
+                    }
+                    let span = tracing::info_span!("consume", subject = %subject, durable = %durable_label);
+                    if let Some(headers) = message.headers.as_ref() {
+                        let parent =
+                            global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)));
+                        let _ = span.set_parent(parent);
+                    }
+                    let started = Instant::now();
+                    let outcome = task_handler(subject.clone(), payload).instrument(span.clone()).await;
+                    METRICS.duration.record(started.elapsed().as_secs_f64(), &labels);
+                    match outcome {
                         Ok(()) => {
                             let _ = message.ack().await;
+                            METRICS
+                                .processed
+                                .add(1, &[labels.as_slice(), &[KeyValue::new("outcome", "ok")]].concat());
                         }
                         Err(err) => {
-                            tracing::error!(subject, error = %err, "handler failed");
-                            let delivered = message.info().map(|info| info.delivered).unwrap_or(1);
+                            span.in_scope(|| tracing::error!(subject, error = %err, "handler failed"));
                             if delivered >= MAX_DELIVER {
                                 if let Err(publish_err) =
                                     js_for_task.publish(dlq.clone(), message.payload.clone()).await
@@ -173,10 +274,15 @@ pub async fn run_consumer(
                                     tracing::error!(subject, error = %publish_err, "DLQ publish failed");
                                 }
                                 let _ = message.ack_with(async_nats::jetstream::AckKind::Term).await;
+                                let dead = KeyValue::new("outcome", "dead_lettered");
+                                METRICS.processed.add(1, &[labels.as_slice(), &[dead]].concat());
                             } else {
                                 let _ = message
                                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(NAK_DELAY)))
                                     .await;
+                                METRICS
+                                    .processed
+                                    .add(1, &[labels.as_slice(), &[KeyValue::new("outcome", "retry")]].concat());
                             }
                         }
                     }
@@ -207,5 +313,26 @@ mod tests {
         let mut stamped = json!({ "event_id": "keep-me" });
         stamp_event_id(&mut stamped);
         assert_eq!(stamped["event_id"], "keep-me");
+    }
+
+    #[test]
+    fn a_trace_crosses_nats_in_the_headers() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let trace_id = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        let remote = SpanContext::new(
+            trace_id,
+            SpanId::from_hex("00f067aa0ba902b7").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+        let sent = opentelemetry::Context::new().with_remote_span_context(remote);
+        let mut headers = async_nats::HeaderMap::new();
+        global::get_text_map_propagator(|p| p.inject_context(&sent, &mut HeaderInjector(&mut headers)));
+        let received = global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(&headers)));
+        assert_eq!(received.span().span_context().trace_id(), trace_id);
     }
 }
