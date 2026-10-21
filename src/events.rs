@@ -141,14 +141,23 @@ static METRICS: LazyLock<ConsumerMetrics> = LazyLock::new(|| {
             .f64_histogram("goway.consumer.duration")
             .with_unit("s")
             .with_description("Time a handler took for one delivery")
+            .with_boundaries(SECONDS.to_vec())
             .build(),
         lag: meter
             .f64_histogram("goway.consumer.lag")
             .with_unit("s")
             .with_description("Time an event waited in the stream before this delivery")
+            .with_boundaries(SECONDS.to_vec())
             .build(),
     }
 });
+
+/// Histogram boundaries in seconds, from a few milliseconds to two minutes. The SDK's defaults (0, 5, 10, 25, …) are
+/// meant for milliseconds: in seconds every delivery under five lands in the first bucket and every percentile reads
+/// 4.75, whatever happened.
+pub const SECONDS: [f64; 14] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
 
 /// What each durable has not been delivered yet, as JetStream reported with its latest delivery.
 static PENDING: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
