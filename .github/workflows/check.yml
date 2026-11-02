@@ -21,7 +21,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fetch --locked
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --frozen -- -D warnings
