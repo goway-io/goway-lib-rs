@@ -13,9 +13,11 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use regex::Regex;
+use sentry::integrations::tracing::{BreadcrumbLayer, ErrorLayer};
 use sentry::protocol::Event;
 use serde_json::Value;
-use tracing_subscriber::filter::filter_fn;
+use tracing::Level;
+use tracing_subscriber::filter::{LevelFilter, filter_fn};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const FILTERED: &str = "[Filtered]";
@@ -143,7 +145,8 @@ pub fn init(
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(sentry::integrations::tracing::layer().span_filter(|_| false))
+        .with(BreadcrumbLayer::new().with_filter(filter_fn(|meta| matches!(*meta.level(), Level::WARN | Level::INFO))))
+        .with(ErrorLayer::new().with_filter(LevelFilter::ERROR))
         .with(traces)
         .with(logs)
         .init();
