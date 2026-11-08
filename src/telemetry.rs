@@ -287,7 +287,10 @@ mod tests {
         let Value::Object(extra) = extra else {
             panic!("extra must be an object")
         };
+        // A fixed id and timestamp: random hex in a fresh event_id can contain "998" and fail the leak check.
         Event {
+            event_id: uuid::Uuid::nil(),
+            timestamp: std::time::UNIX_EPOCH,
             message: Some(message.to_owned()),
             level: Level::Error,
             extra: extra.into_iter().collect::<BTreeMap<_, _>>(),
