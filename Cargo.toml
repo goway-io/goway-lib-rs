@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 actix-web = "4.15.0"
-async-nats = "0.50.0"
+async-nats = "0.51.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 constant_time_eq = "0.6.0"
 dotenvy = "0.15.7"
