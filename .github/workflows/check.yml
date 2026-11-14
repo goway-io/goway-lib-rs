@@ -2,12 +2,12 @@ name: check
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: [development]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

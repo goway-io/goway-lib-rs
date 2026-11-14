@@ -7,7 +7,7 @@ name: security
 
 on:
   push:
-    branches: [main]
+    branches: [development]
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
